@@ -14,9 +14,6 @@
 
 package hub
 
-import (
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
-)
 
 // TeamsLinkService manages pending Teams account link codes.
 // When a ChatLinkStore is set, codes are persisted in the database so they
@@ -29,7 +26,7 @@ type TeamsLinkService struct {
 // a background goroutine that periodically removes expired entries.
 func NewTeamsLinkService() *TeamsLinkService {
 	return &TeamsLinkService{
-		chatLinkService: newChatLinkService(chatlinkcode.ProviderTeams, "Teams"),
+		chatLinkService: newChatLinkService(ChatLinkProviderTeams, "Teams"),
 	}
 }
 

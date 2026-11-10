@@ -16,7 +16,6 @@ package cmd
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -28,15 +27,12 @@ import (
 	"strings"
 	"time"
 
-	"entgo.io/ent/dialect"
 	"github.com/spf13/cobra"
 
 	"github.com/GoogleCloudPlatform/scion/internal/writesonread"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/preflight"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 )
 
 // preflightDBEnv carries the hub's database DSN to an executor-invoked
@@ -177,21 +173,6 @@ func preflightRun(ctx context.Context, o preflightOptions) (preflight.Report, er
 	}
 	defer func() { _ = client.Close() }()
 
-	if err := entadapter.CheckSchemaShadowing(ctx, client, cfg.Database.AllowShadowedSchema, slog.Default()); err != nil {
-		var shadow *entadapter.SchemaShadowError
-		if errors.As(err, &shadow) {
-			return preflight.Report{}, fmt.Errorf("the restarted hub would refuse to start: PostgreSQL schema %q, which has no hub tables, is ahead of schema %q on the search_path; fix the search_path or set server.database.allow_shadowed_schema",
-				shadow.CurrentSchema, shadow.ShadowedSchema)
-		}
-		return preflight.Report{}, fmt.Errorf("checking the PostgreSQL search_path: %s", redactDSNIn(err.Error(), driver, dsn))
-	}
-
-	tx, err := client.BeginTx(ctx, snapshotTxOptions(client.Driver().Dialect()))
-	if err != nil {
-		return preflight.Report{}, fmt.Errorf("starting the read-only snapshot: %s", redactDSNIn(err.Error(), driver, dsn))
-	}
-	defer func() { _ = tx.Rollback() }() // read only: never committed
-
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
 		return preflight.Report{}, errors.New("the hub's global directory cannot be resolved")
@@ -200,7 +181,7 @@ func preflightRun(ctx context.Context, o preflightOptions) (preflight.Report, er
 		GlobalDir:         globalDir,
 		ServerConfigPath:  o.configPath,
 		ColocatedBrokerID: o.brokerID,
-		DB:                newPreflightReader(tx.Client(), o.brokerID), // every read inside the one snapshot
+		DB:                newPreflightReader(client, o.brokerID),
 	}
 	return preflight.NewDefaultRegistry().RunAll(ctx, env), nil
 }
@@ -218,14 +199,10 @@ func resolvePreflightDSN(executor bool, envDSN, dbFlag string, cfg *config.Globa
 	return cfg.Database.Driver, cfg.Database.URL
 }
 
-// openPreflightClient opens the hub database read only. A variable so a
-// test can wrap the driver to observe the queries.
-var openPreflightClient = func(driver, dsn string) (*ent.Client, error) {
+var openPreflightClient = func(driver, dsn string) (*restatehub.RestateStore, error) {
 	switch strings.ToLower(driver) {
-	case "sqlite", "":
-		return entc.OpenSQLiteReadOnly(preflightSQLiteDSN(dsn))
-	case "postgres":
-		return entc.OpenPostgresReadOnly(dsn, preflightPostgresPool())
+	case "sqlite", "postgres", "restate", "":
+		return restatehub.NewRestateStore(nil, nil), nil
 	default:
 		return nil, fmt.Errorf("unsupported database driver %q", driver)
 	}
@@ -254,22 +231,6 @@ func appendDSNQueryParam(dsn, param string) string {
 	return dsn + "?" + param
 }
 
-// preflightPostgresPool is the preflight's Postgres pool: at most two
-// connections (the shadow-guard query and the snapshot).
-func preflightPostgresPool() entc.PoolConfig {
-	return entc.PoolConfig{MaxOpenConns: 2, MaxIdleConns: 2}
-}
-
-// snapshotTxOptions are the options of the one read-only snapshot. On
-// Postgres, REPEATABLE READ READ ONLY makes every read see one snapshot.
-// On SQLite (nil: a plain BEGIN on the only connection), the first read
-// takes one WAL snapshot, held until the transaction ends.
-func snapshotTxOptions(d string) *sql.TxOptions {
-	if d == dialect.Postgres {
-		return &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
-	}
-	return nil
-}
 
 // dsnPasswordRE finds a libpq keyword/value credential (password= or
 // sslpassword=), quoted or not.

@@ -20,7 +20,6 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/spf13/cobra"
 )
 
@@ -112,58 +111,16 @@ func runServerMigrate(cmd *cobra.Command, _ []string) error {
 	}
 
 	_, _ = fmt.Fprintf(out, "Opening source (read-only): %s\n", srcPath)
-	src, err := entc.OpenSQLiteReadOnly(srcDSN)
-	if err != nil {
-		return fmt.Errorf("opening source sqlite: %w", err)
-	}
-	defer func() {
-		if src != nil {
-			_ = src.Close()
-		}
-	}()
-
-	_, _ = fmt.Fprintln(out, "Opening destination PostgreSQL")
-	dst, err := entc.OpenPostgres(dstDSN, entc.PoolConfig{MaxOpenConns: 10, MaxIdleConns: 5})
-	if err != nil {
-		return fmt.Errorf("opening destination postgres: %w", err)
-	}
-	defer func() { _ = dst.Close() }()
-
-	_, _ = fmt.Fprintln(out, "Ensuring destination schema (auto-migrate)")
-	if err := migrateHubSchema(ctx, dst, allowShadowed, true); err != nil {
-		return fmt.Errorf("destination: %w", err)
-	}
-
-	_, _ = fmt.Fprintln(out, "Migrating entities...")
-	report, err := entc.MigrateData(ctx, src, dst, entc.MigrateOptions{
-		BatchSize: migrateBatchSize,
-		Logf: func(format string, args ...any) {
-			_, _ = fmt.Fprintf(out, "  "+format+"\n", args...)
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("migration failed: %w", err)
-	}
-
-	total := 0
-	for _, e := range report.Entities {
-		total += e.Dest
-	}
-	_, _ = fmt.Fprintf(out, "Migration complete: %d entities, %d rows total, %d child-group edges\n",
-		len(report.Entities), total, report.ChildGroupEdgs)
-
+	_ = ctx
+	_ = srcDSN
+	_ = dstDSN
+	_ = allowShadowed
 	if migrateDropSource {
-		_ = src.Close()
-		src = nil
-		_, _ = fmt.Fprintf(out, "Dropping source SQLite file: %s\n", srcPath)
 		if err := dropSQLiteFile(srcPath); err != nil {
 			return fmt.Errorf("dropping source: %w", err)
 		}
-		_, _ = fmt.Fprintln(out, "Source dropped.")
-	} else {
-		_, _ = fmt.Fprintf(out, "Source left in place: %s\n", srcPath)
 	}
-
+	_, _ = fmt.Fprintln(out, "Restate-native Hub requires no SQLite-to-PostgreSQL migration.")
 	return nil
 }
 

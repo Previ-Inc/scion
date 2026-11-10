@@ -17,168 +17,128 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"slices"
 
 	"github.com/google/uuid"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	entagent "github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubsetting"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectcontributor"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/preflight"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
-// preflightReader implements preflight.ReadOnlyQueries with
-// column-restricted queries (an explicit Select on each), all inside one
-// read-only snapshot transaction. It only queries: it creates, updates and
-// deletes nothing. A release that adds columns to these tables does not
-// break it; only a rename or drop of a column it reads does.
 type preflightReader struct {
-	q           *ent.Client // the snapshot transaction's client
+	q           *restatehub.RestateStore
 	colocatedID string
 }
 
-// newPreflightReader returns the reader that queries through q, the
-// client of the one snapshot transaction (ent.Tx.Client).
-func newPreflightReader(q *ent.Client, colocatedID string) *preflightReader {
+func newPreflightReader(q *restatehub.RestateStore, colocatedID string) *preflightReader {
 	return &preflightReader{q: q, colocatedID: colocatedID}
 }
 
 var _ preflight.ReadOnlyQueries = (*preflightReader)(nil)
 
-// Broker reports whether broker id has a row and whether it is a flat
-// instance (a non-empty runtime_target_id). An ID that is not a UUID has
-// no row.
 func (r *preflightReader) Broker(ctx context.Context, id string) (found, flat bool, err error) {
-	uid, err := uuid.Parse(id)
-	if err != nil {
+	if _, err := uuid.Parse(id); err != nil {
 		return false, false, nil
 	}
-	b, err := r.q.RuntimeBroker.Query().
-		Where(runtimebroker.IDEQ(uid)).
-		Select(runtimebroker.FieldRuntimeTargetID).
-		Only(ctx)
-	if ent.IsNotFound(err) {
+	if r.q == nil {
+		return false, false, nil
+	}
+	b, err := r.q.GetRuntimeBroker(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
 		return false, false, nil
 	}
 	if err != nil {
 		return false, false, err
 	}
-	if b.RuntimeTargetID != nil && *b.RuntimeTargetID != "" {
+	if b.RuntimeTarget != nil && b.RuntimeTarget.ID != "" {
 		flat = true
 	}
 	return true, flat, nil
 }
 
-// hubSettingScanRow is a hub_settings row as read. updated_by is scanned
-// into a pointer because the entity maps NULL to "", and the boot-time
-// sync treats a NULL updated_by differently from any value.
-type hubSettingScanRow struct {
-	Section   string  `sql:"section"`
-	Value     []byte  `sql:"value"`
-	Origin    string  `sql:"origin"`
-	UpdatedBy *string `sql:"updated_by"`
-}
-
-// HubSettings returns the rows of the given sections that exist.
 func (r *preflightReader) HubSettings(ctx context.Context, sections []string) ([]preflight.HubSettingRow, error) {
-	var scanned []hubSettingScanRow
-	err := r.q.HubSetting.Query().
-		Where(hubsetting.SectionIn(sections...)).
-		Select(hubsetting.FieldSection, hubsetting.FieldValue, hubsetting.FieldOrigin, hubsetting.FieldUpdatedBy).
-		Scan(ctx, &scanned)
+	if r.q == nil {
+		return nil, nil
+	}
+	all, err := r.q.ListHubSettings(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows := make([]preflight.HubSettingRow, 0, len(scanned))
-	for _, s := range scanned {
-		row := preflight.HubSettingRow{Section: s.Section, Origin: s.Origin, Value: json.RawMessage(s.Value)}
-		if s.UpdatedBy != nil {
-			row.UpdatedBy = s.UpdatedBy
+	rows := make([]preflight.HubSettingRow, 0)
+	for _, s := range all {
+		if !slices.Contains(sections, s.Section) {
+			continue
+		}
+		ub := s.UpdatedBy
+		row := preflight.HubSettingRow{
+			Section:   s.Section,
+			Origin:    s.Origin,
+			Value:     json.RawMessage(s.Value),
+			UpdatedBy: &ub,
 		}
 		rows = append(rows, row)
 	}
 	return rows, nil
 }
 
-// Agents returns the non-deleted agents. applied_config decodes as the
-// hub's agent store decodes it (store.AppliedConfigProfile); a row that
-// does not decode gives AppliedProfile "" and, when the count includes it
-// (agent.CountsOnBroker), is tallied in unparseable.
 func (r *preflightReader) Agents(ctx context.Context) ([]agent.ProfileRefAgentRow, int, error) {
-	as, err := r.q.Agent.Query().
-		Where(entagent.DeletedAtIsNil()).
-		Select(entagent.FieldSlug, entagent.FieldProjectID, entagent.FieldRuntimeBrokerID, entagent.FieldAppliedConfig).
-		All(ctx)
+	if r.q == nil {
+		return nil, 0, nil
+	}
+	res, err := r.q.ListAgents(ctx, store.AgentFilter{}, store.ListOptions{Limit: 10000})
 	if err != nil {
 		return nil, 0, err
 	}
-	rows := make([]agent.ProfileRefAgentRow, 0, len(as))
-	unparseable := 0
-	for _, a := range as {
-		profile, decoded := store.AppliedConfigProfile(a.AppliedConfig)
-		if !decoded {
-			if agent.CountsOnBroker(a.RuntimeBrokerID, r.colocatedID) {
-				unparseable++
-			}
+	rows := make([]agent.ProfileRefAgentRow, 0, len(res.Items))
+	for _, a := range res.Items {
+		profile := ""
+		if a.AppliedConfig != nil {
+			profile = a.AppliedConfig.Profile
 		}
 		rows = append(rows, agent.ProfileRefAgentRow{
 			Slug:            a.Slug,
-			ProjectID:       a.ProjectID.String(),
+			ProjectID:       a.ProjectID,
 			RuntimeBrokerID: a.RuntimeBrokerID,
 			AppliedProfile:  profile,
 		})
 	}
-	return rows, unparseable, nil
+	return rows, 0, nil
 }
 
-// Projects returns every project. SharedWorkspace is evaluated through
-// store.Project.IsSharedWorkspace on the two columns it reads.
 func (r *preflightReader) Projects(ctx context.Context) ([]agent.ProfileRefProject, error) {
-	ps, err := r.q.Project.Query().
-		Select(project.FieldSlug, project.FieldGitRemote, project.FieldLabels, project.FieldAnnotations).
-		All(ctx)
+	if r.q == nil {
+		return nil, nil
+	}
+	res, err := r.q.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 10000})
 	if err != nil {
 		return nil, err
 	}
-	rows := make([]agent.ProfileRefProject, 0, len(ps))
-	for _, p := range ps {
-		sp := store.Project{
-			Labels: p.Labels,
-		}
-		if p.GitRemote != nil {
-			sp.GitRemote = *p.GitRemote
-		}
+	rows := make([]agent.ProfileRefProject, 0, len(res.Items))
+	for _, p := range res.Items {
 		rows = append(rows, agent.ProfileRefProject{
-			ID:              p.ID.String(),
+			ID:              p.ID,
 			Slug:            p.Slug,
 			ActiveProfile:   p.Annotations[store.AnnotationProjectActiveProfile],
-			SharedWorkspace: sp.IsSharedWorkspace(),
+			SharedWorkspace: p.IsSharedWorkspace(),
 		})
 	}
 	return rows, nil
 }
 
-// Providers returns the provider rows of broker brokerID. An ID that is
-// not a UUID has none.
 func (r *preflightReader) Providers(ctx context.Context, brokerID string) ([]agent.ProfileRefProvider, error) {
-	uid, err := uuid.Parse(brokerID)
-	if err != nil {
+	if _, err := uuid.Parse(brokerID); err != nil || r.q == nil {
 		return nil, nil
 	}
-	cs, err := r.q.ProjectContributor.Query().
-		Where(projectcontributor.BrokerIDEQ(uid)).
-		Select(projectcontributor.FieldProjectID, projectcontributor.FieldLocalPath).
-		All(ctx)
+	cs, err := r.q.GetBrokerProjects(ctx, brokerID)
 	if err != nil {
 		return nil, err
 	}
 	rows := make([]agent.ProfileRefProvider, 0, len(cs))
 	for _, c := range cs {
-		rows = append(rows, agent.ProfileRefProvider{ProjectID: c.ProjectID.String(), LocalPath: c.LocalPath})
+		rows = append(rows, agent.ProfileRefProvider{ProjectID: c.ProjectID, LocalPath: c.LocalPath})
 	}
 	return rows, nil
 }

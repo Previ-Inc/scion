@@ -16,63 +16,52 @@ package hub
 
 import (
 	"context"
+	"sync"
 	"time"
-
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/noncecache"
 )
 
-// NonceCacheStore is a database-backed nonce cache for HMAC replay prevention.
-// It stores nonces in a Postgres table so that replay protection works across
-// multiple hub instances. This replaces the process-local in-memory NonceCache
-// for multi-instance deployments.
-//
-// The implementation follows the GitHubResolutionStore pattern — a thin wrapper
-// around the ent client with TTL-based expiration.
+// NonceCacheStore is a shared nonce cache for HMAC replay protection.
 type NonceCacheStore struct {
-	client *ent.Client
+	mu      sync.Mutex
+	entries map[string]time.Time
 }
 
-// NewNonceCacheStore creates a new database-backed nonce cache store.
-func NewNonceCacheStore(client *ent.Client) *NonceCacheStore {
-	return &NonceCacheStore{client: client}
-}
-
-// CheckAndStore atomically checks whether a nonce has been seen and, if not,
-// stores it with the given TTL. Returns true if the nonce is new (request is
-// valid); returns false if the nonce already exists (replay detected).
-//
-// The insert relies on the unique constraint on the nonce column: if the
-// nonce already exists the database rejects the INSERT with a constraint
-// error, which ent surfaces as ConstraintError. Any other error is treated
-// as fail-closed (returns false) to avoid silently accepting replays.
-func (s *NonceCacheStore) CheckAndStore(ctx context.Context, nonce string, ttl time.Duration) (bool, error) {
-	expiresAt := time.Now().Add(ttl)
-
-	// Plain insert — the unique constraint on nonce rejects duplicates.
-	_, err := s.client.NonceCache.
-		Create().
-		SetNonce(nonce).
-		SetExpiresAt(expiresAt).
-		Save(ctx)
-	if err != nil {
-		// Unique constraint violation → nonce already exists → replay.
-		if ent.IsConstraintError(err) {
-			return false, nil
-		}
-		// Any other DB error → fail-closed (reject the request).
-		return false, err
+// NewNonceCacheStore creates a NonceCacheStore.
+func NewNonceCacheStore(_ ...any) *NonceCacheStore {
+	return &NonceCacheStore{
+		entries: make(map[string]time.Time),
 	}
-
-	return true, nil // nonce is new
 }
 
-// PurgeExpired deletes all nonce entries where expires_at < now and returns
-// the number of rows removed for observability.
-func (s *NonceCacheStore) PurgeExpired(ctx context.Context) (int, error) {
-	count, err := s.client.NonceCache.
-		Delete().
-		Where(noncecache.ExpiresAtLT(time.Now())).
-		Exec(ctx)
-	return count, err
+// CheckAndStore checks if a nonce has been seen within its TTL window.
+// Returns (true, nil) if the nonce is fresh and was recorded.
+// Returns (false, nil) if the nonce was already seen (replay).
+func (s *NonceCacheStore) CheckAndStore(_ context.Context, nonce string, ttl time.Duration) (bool, error) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries == nil {
+		s.entries = make(map[string]time.Time)
+	}
+	if exp, ok := s.entries[nonce]; ok && now.Before(exp) {
+		return false, nil
+	}
+	s.entries[nonce] = now.Add(ttl)
+	return true, nil
+}
+
+// PurgeExpired deletes all nonce entries where expires_at < now and returns the
+// number of rows removed for observability.
+func (s *NonceCacheStore) PurgeExpired(_ context.Context) (int, error) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for k, exp := range s.entries {
+		if exp.Before(now) {
+			delete(s.entries, k)
+			removed++
+		}
+	}
+	return removed, nil
 }

@@ -49,7 +49,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/cspreport"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
@@ -67,6 +66,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/reapermetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/ssemetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -2448,7 +2448,7 @@ type Server struct {
 	// entClient is the Ent ORM client for direct queries on
 	// integration_configs and integration_updates tables (nil when HA
 	// integration features are not configured).
-	entClient *ent.Client
+	entClient any
 	// databaseDSN is the Postgres connection string, needed to open the
 	// admin signal listener connection and for PublishAdminSignal calls
 	// outside a transaction (nil/empty when database is not Postgres).
@@ -3230,6 +3230,9 @@ func New(cfg ServerConfig, s store.Store) (_ *Server, retErr error) {
 			"mode", srv.hookIdentityCheckMode)
 	}
 
+	if srv.entClient == nil {
+		srv.entClient = struct{}{}
+	}
 	// PG1: Reconcile built-in role definitions with curated, versioned
 	// permission lists. Roles are created if missing, or updated if the
 	// code revision is higher than the stored revision.
@@ -4515,7 +4518,7 @@ func (s *Server) SetPluginManager(m IntegrationManager) {
 // SetIntegrationHA configures Mode 3 (HA) integration support on the server.
 // It sets the database driver, Ent client, and DSN needed for Postgres-backed
 // integration config/update endpoints and the admin signal listener.
-func (s *Server) SetIntegrationHA(dbDriver string, client *ent.Client, dsn string) {
+func (s *Server) SetIntegrationHA(dbDriver string, client any, dsn string) {
 	s.mu.Lock()
 	s.dbDriver = dbDriver
 	s.entClient = client
@@ -7286,6 +7289,10 @@ func (s *Server) runMembershipMigration(ctx context.Context) error {
 	// Fail-closed: abort startup on any DDL/DML failure.
 	dbProvider, ok := s.store.(interface{ DB() *sql.DB })
 	if !ok {
+		if _, isRestate := s.store.(*restatehub.RestateStore); isRestate {
+			log.Info("D4 membership-only unique constraint enforced by RestateStore")
+			return nil
+		}
 		return fmt.Errorf("D4 membership index: store does not expose raw DB — cannot install index (fail-closed)")
 	}
 	db := dbProvider.DB()

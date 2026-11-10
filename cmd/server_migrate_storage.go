@@ -16,15 +16,13 @@ package cmd
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 )
 
 var (
@@ -90,35 +88,13 @@ func runMigrateStorage(cmd *cobra.Command, _ []string) error {
 	}
 
 	_, _ = fmt.Fprintf(out, "Opening database: %s (%s)\n", cfg.Database.Driver, config.RedactDatabaseURL(cfg.Database.Driver, cfg.Database.URL))
-	var s *entadapter.CompositeStore
 	switch cfg.Database.Driver {
-	case "sqlite":
-		sqliteDSN := cfg.Database.URL
-		if !strings.HasPrefix(sqliteDSN, "file:") {
-			sqliteDSN = "file:" + sqliteDSN
-		}
-		if !strings.Contains(sqliteDSN, "?") {
-			sqliteDSN += "?cache=shared"
-		} else if !strings.Contains(sqliteDSN, "cache=") {
-			sqliteDSN += "&cache=shared"
-		}
-		client, err := entc.OpenSQLite(sqliteDSN, entc.PoolConfig{})
-		if err != nil {
-			return fmt.Errorf("failed to open database: %w", err)
-		}
-		s = entadapter.NewCompositeStore(client)
-		defer func() { _ = s.Close() }()
-	case "postgres":
-		client, err := entc.OpenPostgres(cfg.Database.URL, entc.PoolConfig{MaxOpenConns: 5, MaxIdleConns: 2})
-		if err != nil {
-			return fmt.Errorf("failed to open database: %w", err)
-		}
-		s = entadapter.NewCompositeStore(client)
-		defer func() { _ = s.Close() }()
+	case "sqlite", "postgres", "restate", "":
 	default:
 		return fmt.Errorf("unsupported database driver: %s", cfg.Database.Driver)
 	}
-
+	s := restatehub.NewRestateStore(nil, nil)
+	defer func() { _ = s.Close() }()
 	_, _ = fmt.Fprintf(out, "Initializing storage: gs://%s\n", bucket)
 	stor, err := storage.New(ctx, storage.Config{
 		Provider: storage.Provider(cfg.Storage.Provider),

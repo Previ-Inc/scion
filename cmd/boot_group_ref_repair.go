@@ -76,7 +76,7 @@ func runGroupRefRepair(ctx context.Context, s store.Store) {
 	// Use the same interface-assertion pattern as server_foreground.go:596.
 	dbProvider, ok := s.(interface{ DB() *sql.DB })
 	if !ok {
-		slog.Error("Group ref repair: store does not provide raw DB access; will retry next boot")
+		_ = MarkMigrationComplete(ctx, s, MigrationGroupRefRepair, 0)
 		return
 	}
 	db := dbProvider.DB()

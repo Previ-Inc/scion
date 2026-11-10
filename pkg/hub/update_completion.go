@@ -23,7 +23,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/integrationupdate"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 )
 
@@ -41,18 +40,27 @@ type pendingUpdateEntry struct {
 	timer            *time.Timer
 }
 
-// pendingUpdateTracker manages poll-based completion detection for HA updates.
-// While an update is pending, a goroutine polls BrokerInfo at a fixed interval
-// and compares the version. OnReconnect callbacks serve as an optional
-// fast-path hint to trigger an immediate poll.
+type integrationUpdateRecord struct {
+	ID          uuid.UUID
+	Integration string
+	State       string
+	Detail      string
+	NewVersion  string
+	RequestedBy string
+	CreateTime  time.Time
+	UpdateTime  time.Time
+}
+
 type pendingUpdateTracker struct {
 	mu      sync.Mutex
-	pending map[string]*pendingUpdateEntry // integration name -> entry
+	pending map[string]*pendingUpdateEntry
+	updates map[uuid.UUID]*integrationUpdateRecord
 }
 
 func newPendingUpdateTracker() *pendingUpdateTracker {
 	return &pendingUpdateTracker{
 		pending: make(map[string]*pendingUpdateEntry),
+		updates: make(map[uuid.UUID]*integrationUpdateRecord),
 	}
 }
 
@@ -127,7 +135,7 @@ func (s *Server) triggerImmediatePoll(integrationName string) {
 // checkUpdateCompletion checks if the integration version has changed,
 // indicating the update completed successfully.
 func (s *Server) checkUpdateCompletion(integrationName, updateID, preUpdateVersion string) {
-	if s.entClient == nil {
+	if s.updateTracker == nil {
 		return
 	}
 
@@ -141,8 +149,6 @@ func (s *Server) checkUpdateCompletion(integrationName, updateID, preUpdateVersi
 
 	newVersion, _, _, err := mgr.BrokerInfo(integrationName)
 	if err != nil {
-		slog.Debug("BrokerInfo poll failed (integration may be restarting)",
-			"integration", integrationName, "error", err)
 		return
 	}
 
@@ -150,46 +156,21 @@ func (s *Server) checkUpdateCompletion(integrationName, updateID, preUpdateVersi
 	if err != nil {
 		return
 	}
-
-	// Empty pre-update version means we couldn't capture baseline —
-	// treat as inconclusive and let the timeout decide.
-	if preUpdateVersion == "" {
-		slog.Debug("No pre-update version baseline, skipping completion check",
-			"integration", integrationName)
+	if preUpdateVersion == "" || newVersion == preUpdateVersion {
 		return
 	}
 
-	// Version unchanged — continue polling.
-	if newVersion == preUpdateVersion {
+	s.updateTracker.mu.Lock()
+	rec, ok := s.updateTracker.updates[uid]
+	if !ok || rec.State == "completed" || rec.State == "failed" {
+		s.updateTracker.mu.Unlock()
 		return
 	}
-
-	// Version changed — mark completed (guarded write).
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	affected, err := s.entClient.IntegrationUpdate.
-		Update().
-		Where(
-			integrationupdate.IDEQ(uid),
-			integrationupdate.StateNotIn(
-				integrationupdate.StateCompleted,
-				integrationupdate.StateFailed,
-			),
-		).
-		SetState(integrationupdate.StateCompleted).
-		SetNewVersion(newVersion).
-		SetDetail("").
-		Save(ctx)
-	if err != nil {
-		slog.Error("Failed to mark update as completed",
-			"integration", integrationName, "id", updateID, "error", err)
-		return
-	}
-	if affected == 0 {
-		return
-	}
-
+	rec.State = "completed"
+	rec.NewVersion = newVersion
+	rec.Detail = ""
+	rec.UpdateTime = time.Now().UTC()
+	s.updateTracker.mu.Unlock()
 	slog.Info("Update completed — version changed",
 		"integration", integrationName, "old_version", preUpdateVersion,
 		"new_version", newVersion)
@@ -206,48 +187,24 @@ func (s *Server) checkUpdateCompletion(integrationName, updateID, preUpdateVersi
 
 // handleUpdateTimeout marks an update as failed due to timeout.
 func (s *Server) handleUpdateTimeout(integrationName, updateID string) {
-	if s.entClient == nil {
+	if s.updateTracker == nil {
 		return
 	}
 
-	// Only delete tracker entry if updateID matches.
 	s.updateTracker.mu.Lock()
 	if e, ok := s.updateTracker.pending[integrationName]; ok && e.updateID == updateID {
 		e.cancel()
 		delete(s.updateTracker.pending, integrationName)
 	}
-	s.updateTracker.mu.Unlock()
-
 	uid, err := uuid.Parse(updateID)
-	if err != nil {
-		slog.Error("Invalid update ID in timeout handler", "id", updateID, "error", err)
-		return
+	if err == nil {
+		if rec, ok := s.updateTracker.updates[uid]; ok && rec.State != "completed" && rec.State != "failed" {
+			rec.State = "failed"
+			rec.Detail = "Update timed out — version unchanged after restart"
+			rec.UpdateTime = time.Now().UTC()
+		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	affected, err := s.entClient.IntegrationUpdate.
-		Update().
-		Where(
-			integrationupdate.IDEQ(uid),
-			integrationupdate.StateNotIn(
-				integrationupdate.StateCompleted,
-				integrationupdate.StateFailed,
-			),
-		).
-		SetState(integrationupdate.StateFailed).
-		SetDetail("Update timed out — version unchanged after restart").
-		Save(ctx)
-	if err != nil {
-		slog.Error("Failed to mark update as timed out",
-			"integration", integrationName, "id", updateID, "error", err)
-		return
-	}
-	if affected > 0 {
-		slog.Warn("Update timed out",
-			"integration", integrationName, "id", updateID)
-	}
+	s.updateTracker.mu.Unlock()
 }
 
 // registerReconnectCallbacks sets up reconnect callbacks on all HA integration
@@ -277,68 +234,35 @@ func (s *Server) registerReconnectCallbacks(mgr IntegrationManager) {
 // were pending when the hub last shut down. Recent rows get their tracking
 // re-armed; old rows are marked failed.
 func (s *Server) sweepOrphanedUpdates() {
-	if s.entClient == nil || s.updateTracker == nil {
+	if s.updateTracker == nil {
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	rows, err := s.entClient.IntegrationUpdate.Query().
-		Where(
-			integrationupdate.StateNotIn(
-				integrationupdate.StateCompleted,
-				integrationupdate.StateFailed,
-			),
-		).
-		All(ctx)
-	if err != nil {
-		slog.Error("Failed to sweep orphaned integration updates", "error", err)
-		return
-	}
-
-	if len(rows) == 0 {
-		return
-	}
-
 	now := time.Now()
-	for _, row := range rows {
-		age := now.Sub(row.CreateTime)
-		if age >= defaultUpdateTimeout {
-			// Too old — mark failed.
-			_, fErr := s.entClient.IntegrationUpdate.
-				Update().
-				Where(
-					integrationupdate.IDEQ(row.ID),
-					integrationupdate.StateNotIn(
-						integrationupdate.StateCompleted,
-						integrationupdate.StateFailed,
-					),
-				).
-				SetState(integrationupdate.StateFailed).
-				SetDetail("Update orphaned — hub restarted after timeout expired").
-				Save(ctx)
-			if fErr != nil {
-				slog.Error("Failed to fail-mark orphaned update",
-					"integration", row.Integration, "id", row.ID, "error", fErr)
-			} else {
-				slog.Info("Marked orphaned update as failed",
-					"integration", row.Integration, "id", row.ID, "age", age)
-			}
+	s.updateTracker.mu.Lock()
+	var toRearm []*integrationUpdateRecord
+	for _, row := range s.updateTracker.updates {
+		if row.State == "completed" || row.State == "failed" {
 			continue
 		}
+		age := now.Sub(row.CreateTime)
+		if age >= defaultUpdateTimeout {
+			row.State = "failed"
+			row.Detail = "Update orphaned — hub restarted after timeout expired"
+			row.UpdateTime = now.UTC()
+			continue
+		}
+		cp := *row
+		toRearm = append(toRearm, &cp)
+	}
+	s.updateTracker.mu.Unlock()
 
-		// Recent enough — re-arm tracking with remaining timeout.
+	for _, row := range toRearm {
 		preUpdateVersion := ""
 		if strings.HasPrefix(row.Detail, "pre_update_version=") {
 			preUpdateVersion = strings.TrimPrefix(row.Detail, "pre_update_version=")
 		}
-
-		remaining := defaultUpdateTimeout - age
+		remaining := defaultUpdateTimeout - now.Sub(row.CreateTime)
 		s.rearmUpdateTracking(row.Integration, row.ID.String(), preUpdateVersion, remaining)
-		slog.Info("Re-armed tracking for orphaned update",
-			"integration", row.Integration, "id", row.ID,
-			"remaining_timeout", remaining)
 	}
 }
 

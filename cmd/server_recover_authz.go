@@ -28,9 +28,8 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -193,61 +192,21 @@ func runRecoverAuthz(cmd *cobra.Command, _ []string) error {
 	return recoverDisableSingleConstraint(ctx, s, recoverDisableConstraint, operator, out)
 }
 
-func openRecoveryStore(ctx context.Context, cfg *config.GlobalConfig) (*entadapter.CompositeStore, error) {
-	pool := entc.PoolConfig{
-		MaxOpenConns: 2,
-		MaxIdleConns: 2,
-	}
-
-	var entClient interface{ Close() error }
-	var cs *entadapter.CompositeStore
-
+func openRecoveryStore(ctx context.Context, cfg *config.GlobalConfig) (*restatehub.RestateStore, error) {
 	switch strings.ToLower(cfg.Database.Driver) {
-	case "sqlite", "":
-		sqliteDSN := cfg.Database.URL
-		if !strings.HasPrefix(sqliteDSN, "file:") {
-			sqliteDSN = "file:" + sqliteDSN
-		}
-		if !strings.Contains(sqliteDSN, "?") {
-			sqliteDSN += "?cache=shared"
-		} else if !strings.Contains(sqliteDSN, "cache=") {
-			sqliteDSN += "&cache=shared"
-		}
-		ec, err := entc.OpenSQLite(sqliteDSN, pool)
-		if err != nil {
-			return nil, err
-		}
-		entClient = ec
-		cs = entadapter.NewCompositeStore(ec)
-	case "postgres":
-		ec, err := entc.OpenPostgres(cfg.Database.URL, pool)
-		if err != nil {
-			return nil, err
-		}
-		entClient = ec
-		cs = entadapter.NewCompositeStore(ec)
+	case "sqlite", "postgres", "restate", "":
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", cfg.Database.Driver)
 	}
-
-	// Run migrations to ensure schema is up to date, behind the same
-	// PostgreSQL search_path shadow guard as server start.
+	cs := restatehub.NewRestateStore(nil, nil)
 	if err := migrateHubStore(ctx, cs, cfg.Database.AllowShadowedSchema); err != nil {
-		_ = entClient.Close()
+		_ = cs.Close()
 		return nil, fmt.Errorf("failed to run database migration: %w", err)
 	}
-
 	return cs, nil
 }
 
-// acquireRecoveryLock tries to acquire an exclusive advisory lock and returns
-// a release function that the caller must defer. If the lock cannot be acquired,
-// it means another server instance or recovery process is running, and the
-// command refuses to proceed.
-//
-// On Postgres, this uses pg_try_advisory_lock. On SQLite, the lock is a no-op
-// (always succeeds) because the single-writer model already serializes access.
-func acquireRecoveryLock(ctx context.Context, s *entadapter.CompositeStore, out io.Writer) (func() error, error) {
+func acquireRecoveryLock(ctx context.Context, s *restatehub.RestateStore, out io.Writer) (func() error, error) {
 	acquired, release, err := s.TryAdvisoryLock(ctx, store.LockRecoveryAuthz)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire maintenance lock: %w", err)
@@ -262,7 +221,7 @@ func acquireRecoveryLock(ctx context.Context, s *entadapter.CompositeStore, out 
 	return release, nil
 }
 
-func recoverDisableSingleConstraint(ctx context.Context, s *entadapter.CompositeStore, constraintID, operator string, out io.Writer) error {
+func recoverDisableSingleConstraint(ctx context.Context, s *restatehub.RestateStore, constraintID, operator string, out io.Writer) error {
 	// Look up the constraint
 	constraint, err := s.GetAccessConstraint(ctx, constraintID)
 	if err != nil {
@@ -318,7 +277,7 @@ func recoverDisableSingleConstraint(ctx context.Context, s *entadapter.Composite
 // errors rather than silently truncating.
 const maxConstraintLimit = 1000
 
-func recoverDisableAllConstraints(ctx context.Context, s *entadapter.CompositeStore, operator string, out io.Writer) error {
+func recoverDisableAllConstraints(ctx context.Context, s *restatehub.RestateStore, operator string, out io.Writer) error {
 	// List all constraints
 	constraints, err := s.ListAccessConstraints(ctx, maxConstraintLimit, 0)
 	if err != nil {

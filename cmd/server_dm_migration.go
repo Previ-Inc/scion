@@ -21,10 +21,9 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/spf13/cobra"
 )
 
@@ -110,65 +109,32 @@ func runDMMigrationWithStore(ctx context.Context, s store.Store, cfg messaging.D
 // openDMMigrationStore resolves the database DSN and returns a CompositeStore.
 // Precedence: --db flag > config file (via LoadGlobalConfig).
 // Mirrors openBackfillStore in server_backfill.go.
-func openDMMigrationStore(ctx context.Context) (*entadapter.CompositeStore, error) {
+func openDMMigrationStore(ctx context.Context) (*restatehub.RestateStore, error) {
 	cfg, err := config.LoadGlobalConfig(serverConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
-
-	// --db flag overrides config.
 	if dmMigrationDB != "" {
 		cfg.Database.URL = dmMigrationDB
-		// Auto-detect driver from DSN.
 		if strings.HasPrefix(dmMigrationDB, "postgres://") || strings.HasPrefix(dmMigrationDB, "postgresql://") {
 			cfg.Database.Driver = "postgres"
 		} else {
 			cfg.Database.Driver = "sqlite"
 		}
 	}
-
 	if cfg.Database.URL == "" {
 		return nil, fmt.Errorf("no database configured: set --db, SCION_SERVER_DATABASE_URL env, or database.url in server config")
 	}
-
-	var s *entadapter.CompositeStore
-
 	switch cfg.Database.Driver {
-	case "sqlite":
-		dsn := cfg.Database.URL
-		if !strings.HasPrefix(dsn, "file:") {
-			dsn = "file:" + dsn
-		}
-		if !strings.Contains(dsn, "?") {
-			dsn += "?cache=shared"
-		} else if !strings.Contains(dsn, "cache=") {
-			dsn += "&cache=shared"
-		}
-		client, err := entc.OpenSQLite(dsn, entc.PoolConfig{})
-		if err != nil {
-			return nil, fmt.Errorf("opening sqlite: %w", err)
-		}
-		if err := migrateMaintenanceDB(ctx, client, dmMigrationExecute, cfg.Database.AllowShadowedSchema); err != nil {
-			_ = client.Close()
-			return nil, err
-		}
-		s = entadapter.NewCompositeStore(client)
-
-	case "postgres":
-		client, err := entc.OpenPostgres(cfg.Database.URL, entc.PoolConfig{MaxOpenConns: 10, MaxIdleConns: 5})
-		if err != nil {
-			return nil, fmt.Errorf("opening postgres (verify DSN and network connectivity): %w", err)
-		}
-		if err := migrateMaintenanceDB(ctx, client, dmMigrationExecute, cfg.Database.AllowShadowedSchema); err != nil {
-			_ = client.Close()
-			return nil, err
-		}
-		s = entadapter.NewCompositeStore(client)
-
+	case "sqlite", "postgres", "restate", "":
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", cfg.Database.Driver)
 	}
-
+	s := restatehub.NewRestateStore(nil, nil)
+	if err := migrateMaintenanceDB(ctx, s, dmMigrationExecute, cfg.Database.AllowShadowedSchema); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 

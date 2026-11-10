@@ -23,10 +23,9 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/spf13/cobra"
 )
 
@@ -102,11 +101,7 @@ func runSecretMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Open database (single Ent-backed store)
-	entClient, err := entc.OpenSQLite("file:"+cfg.Database.URL+"?cache=shared", entc.PoolConfig{})
-	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-	db := entadapter.NewCompositeStore(entClient)
+	db := restatehub.NewRestateStore(nil, nil)
 	defer func() { _ = db.Close() }()
 	if err := migrateHubStore(ctx, db, cfg.Database.AllowShadowedSchema); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)

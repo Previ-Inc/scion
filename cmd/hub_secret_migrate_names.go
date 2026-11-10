@@ -25,11 +25,10 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/spf13/cobra"
 )
 
@@ -360,73 +359,20 @@ func stripDSNQueryParam(dsn, key string) string {
 // Postgres has no equivalent stray-file failure mode (a missing database
 // doesn't get created by connecting to it), so --dry-run there is already
 // write-free by skipping Migrate.
-func openMigrateNamesStore(ctx context.Context, cfg *config.GlobalConfig, dryRun bool) (*entadapter.CompositeStore, error) {
+func openMigrateNamesStore(ctx context.Context, cfg *config.GlobalConfig, dryRun bool) (*restatehub.RestateStore, error) {
 	switch strings.ToLower(cfg.Database.Driver) {
-	case "sqlite", "":
-		dsn := cfg.Database.URL
-		if !strings.HasPrefix(dsn, "file:") {
-			dsn = "file:" + dsn
-		}
-		if dryRun {
-			// Strip any existing "mode" query param before forcing "ro":
-			// appending unconditionally could otherwise produce a DSN with
-			// two conflicting "mode" params (e.g. a configured "mode=rwc")
-			// where the driver's tie-break between them is undocumented
-			// behavior to depend on (ptone/scion#2152 round-3 review nit 12).
-			roDSN := stripDSNQueryParam(dsn, "mode")
-			if strings.Contains(roDSN, "?") {
-				roDSN += "&mode=ro"
-			} else {
-				roDSN += "?mode=ro"
-			}
-			ec, err := entc.OpenSQLiteReadOnly(roDSN)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open sqlite database read-only: %w", err)
-			}
-			return entadapter.NewCompositeStore(ec), nil
-		}
-		if !strings.Contains(dsn, "cache=") {
-			if strings.Contains(dsn, "?") {
-				dsn += "&cache=shared"
-			} else {
-				dsn += "?cache=shared"
-			}
-		}
-		ec, err := entc.OpenSQLite(dsn, entc.PoolConfig{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to open sqlite database: %w", err)
-		}
-		cs := entadapter.NewCompositeStore(ec)
-		if err := migrateHubStore(ctx, cs, cfg.Database.AllowShadowedSchema); err != nil {
-			_ = cs.Close()
-			return nil, fmt.Errorf("failed to run database migration: %w", err)
-		}
-		return cs, nil
-	case "postgres":
-		if dryRun {
-			// OpenPostgresReadOnly sets default_transaction_read_only=on for
-			// every connection: defense in depth on top of --dry-run only
-			// ever calling read-only backend methods (ptone/scion#2152
-			// round-3 review finding 10).
-			ec, err := entc.OpenPostgresReadOnly(cfg.Database.URL, entc.PoolConfig{})
-			if err != nil {
-				return nil, fmt.Errorf("failed to open postgres database read-only: %w", err)
-			}
-			return entadapter.NewCompositeStore(ec), nil
-		}
-		ec, err := entc.OpenPostgres(cfg.Database.URL, entc.PoolConfig{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to open postgres database: %w", err)
-		}
-		cs := entadapter.NewCompositeStore(ec)
-		if err := migrateHubStore(ctx, cs, cfg.Database.AllowShadowedSchema); err != nil {
-			_ = cs.Close()
-			return nil, fmt.Errorf("failed to run database migration: %w", err)
-		}
-		return cs, nil
+	case "sqlite", "postgres", "restate", "":
 	default:
 		return nil, fmt.Errorf("unsupported database driver %q", cfg.Database.Driver)
 	}
+	cs := restatehub.NewRestateStore(nil, nil)
+	if !dryRun {
+		if err := migrateHubStore(ctx, cs, cfg.Database.AllowShadowedSchema); err != nil {
+			_ = cs.Close()
+			return nil, fmt.Errorf("failed to run database migration: %w", err)
+		}
+	}
+	return cs, nil
 }
 
 // migrateNamesCandidate identifies one secret identity to check for name

@@ -14,7 +14,7 @@
 
 package hub
 
-import "github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+import "github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 
 // ProjectStorageMigrateExecutor is the one-shot project storage migration
 // (ptone/scion#5819): on a hub whose
@@ -33,4 +33,4 @@ type ProjectStorageMigrateExecutor struct {
 }
 
 // projectStorageMigrateKey is the maintenance operation key.
-const projectStorageMigrateKey = entadapter.ProjectStorageMigrateKey
+const projectStorageMigrateKey = restatehub.ProjectStorageMigrateKey

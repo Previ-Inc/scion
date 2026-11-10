@@ -32,7 +32,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/maintenance"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/GoogleCloudPlatform/scion/pkg/version"
 )
@@ -341,22 +341,22 @@ func (s *Server) resolveMaintenanceExecutor(key string) (MaintenanceExecutor, er
 			Store:         s.store,
 			SecretBackend: s.GetSecretBackend(),
 		}, nil
-	case entadapter.AppliedConfigTZCleanupKey:
+	case restatehub.AppliedConfigTZCleanupKey:
 		return &AppliedConfigTZCleanupExecutor{Store: s.store}, nil
-	case entadapter.AutoExposeEnvNormalizeKey:
+	case restatehub.AutoExposeEnvNormalizeKey:
 		return &AutoExposeEnvNormalizeExecutor{Store: s.store}, nil
-	case entadapter.UTCTimestampNormalizeKey:
+	case restatehub.UTCTimestampNormalizeKey:
 		db, dbDialect := s.storeDB()
 		return &UTCTimestampNormalizeExecutor{DB: db, Dialect: dbDialect}, nil
-	case entadapter.TemplateBlobGCKey:
+	case restatehub.TemplateBlobGCKey:
 		return &TemplateBlobGCExecutor{srv: s}, nil
-	case entadapter.PassthroughTranslationReviewKey:
+	case restatehub.PassthroughTranslationReviewKey:
 		return &PassthroughTranslationReviewExecutor{srv: s}, nil
-	case entadapter.GroupParticipantModeCleanupKey:
+	case restatehub.GroupParticipantModeCleanupKey:
 		return &GroupParticipantModeCleanupExecutor{Store: s.store}, nil
-	case entadapter.ProjectStorageMigrateKey:
+	case restatehub.ProjectStorageMigrateKey:
 		return &ProjectStorageMigrateExecutor{srv: s}, nil
-	case entadapter.ChatStarReconcileKey:
+	case restatehub.ChatStarReconcileKey:
 		return &ChatStarReconcileExecutor{srv: s}, nil
 	case "pull-images":
 		log.Debug("Resolved pull-images executor",

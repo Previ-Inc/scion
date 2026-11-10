@@ -37,8 +37,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/registry"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/relay"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/transport/ws"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/enttest"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	conduitv1 "github.com/GoogleCloudPlatform/scion/proto/conduit/v1"
 	"github.com/gorilla/websocket"
 )
@@ -69,7 +68,7 @@ func NewWorld(t *testing.T) *World {
 	t.Helper()
 	w := &World{T: t, principals: map[string]relay.Principal{}}
 	w.now.Store(time.Now().UnixNano())
-	w.Inner = entadapter.NewConduitRegistryStore(enttest.NewClient(t))
+	w.Inner = restatehub.NewRestateStore(nil, nil)
 	w.Store = &registry.FaultStore{Inner: w.Inner, Fault: func(_ context.Context, op string) error {
 		if f := w.fault.Load(); f != nil {
 			return (*f)(op)

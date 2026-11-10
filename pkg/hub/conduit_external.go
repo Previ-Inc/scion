@@ -33,7 +33,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/relay"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/router"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 )
 
 // External relay mode (design §3.9 "Separate relay").
@@ -185,13 +184,11 @@ func (s *Server) StartConduitExternal(ctx context.Context, opts ConduitExternalO
 	}
 	st := opts.Store
 	if st == nil {
-		s.mu.RLock()
-		client := s.entClient
-		s.mu.RUnlock()
-		if client == nil {
+		if rs, ok := s.store.(registry.Store); ok {
+			st = rs
+		} else {
 			return errors.New("conduit external relay mode: no database client for the conduit registry")
 		}
-		st = entadapter.NewConduitRegistryStore(client)
 	}
 	reg := opts.Registry
 	if reg == nil {

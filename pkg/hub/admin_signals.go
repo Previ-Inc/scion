@@ -24,7 +24,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -98,25 +97,6 @@ func PublishAdminSignalDB(ctx context.Context, db *sql.DB, signal AdminSignal) e
 		return err
 	}
 	_, err = db.ExecContext(ctx, "SELECT pg_notify($1, $2)", adminSignalChannel, payload)
-	if err != nil {
-		return fmt.Errorf("pg_notify on %s: %w", adminSignalChannel, err)
-	}
-	return nil
-}
-
-// publishAdminSignalTx sends a NOTIFY within an Ent transaction so that the
-// signal is delivered atomically with the associated row write.
-func publishAdminSignalTx(ctx context.Context, tx *ent.Tx, signal AdminSignal) error {
-	payload, err := marshalAdminSignal(signal)
-	if err != nil {
-		return err
-	}
-	var result sql.Result
-	err = tx.Client().Driver().Exec(ctx,
-		"SELECT pg_notify($1, $2)",
-		[]any{adminSignalChannel, payload},
-		&result,
-	)
 	if err != nil {
 		return fmt.Errorf("pg_notify on %s: %w", adminSignalChannel, err)
 	}

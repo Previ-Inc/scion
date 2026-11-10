@@ -14,9 +14,6 @@
 
 package hub
 
-import (
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
-)
 
 // DiscordLinkService manages pending Discord account link codes.
 // When a ChatLinkStore is set, codes are persisted in the database so they
@@ -29,7 +26,7 @@ type DiscordLinkService struct {
 // a background goroutine that periodically removes expired entries.
 func NewDiscordLinkService() *DiscordLinkService {
 	return &DiscordLinkService{
-		chatLinkService: newChatLinkService(chatlinkcode.ProviderDiscord, "Discord"),
+		chatLinkService: newChatLinkService(ChatLinkProviderDiscord, "Discord"),
 	}
 }
 

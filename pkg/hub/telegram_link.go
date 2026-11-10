@@ -14,9 +14,6 @@
 
 package hub
 
-import (
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
-)
 
 // TelegramLinkService manages pending Telegram account link codes.
 // When a ChatLinkStore is set, codes are persisted in the database so they
@@ -29,7 +26,7 @@ type TelegramLinkService struct {
 // a background goroutine that periodically removes expired entries.
 func NewTelegramLinkService() *TelegramLinkService {
 	return &TelegramLinkService{
-		chatLinkService: newChatLinkService(chatlinkcode.ProviderTelegram, "Telegram"),
+		chatLinkService: newChatLinkService(ChatLinkProviderTelegram, "Telegram"),
 	}
 }
 

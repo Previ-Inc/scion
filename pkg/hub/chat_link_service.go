@@ -20,8 +20,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
 )
 
 const (
@@ -44,14 +42,14 @@ type chatLinkService struct {
 
 	verifyLimiter linkVerifyLimiter
 	db            *ChatLinkStore
-	provider      chatlinkcode.Provider
+	provider      ChatLinkProvider
 	providerName  string
 
 	closeOnce sync.Once
 	done      chan struct{}
 }
 
-func newChatLinkService(provider chatlinkcode.Provider, providerName string) *chatLinkService {
+func newChatLinkService(provider ChatLinkProvider, providerName string) *chatLinkService {
 	s := &chatLinkService{
 		pending:       make(map[string]*pendingChatLink),
 		verifyLimiter: newLinkVerifyLimiter(),

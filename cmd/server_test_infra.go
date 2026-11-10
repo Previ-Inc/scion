@@ -25,10 +25,8 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/GoogleCloudPlatform/scion/pkg/testinfra"
 	"github.com/spf13/cobra"
 )
@@ -234,7 +232,7 @@ func checkTestInfraMarkHubID(cfg *config.GlobalConfig, hubID string) error {
 
 // openTestInfraDatabase loads the server configuration, applies a --db
 // override, and opens (and migrates) the configured database.
-func openTestInfraDatabase(ctx context.Context, configPath, dbURL string) (*config.GlobalConfig, *ent.Client, error) {
+func openTestInfraDatabase(ctx context.Context, configPath, dbURL string) (*config.GlobalConfig, *restatehub.RestateStore, error) {
 	cfg, err := loadTestInfraConfig(configPath, dbURL)
 	if err != nil {
 		return nil, nil, err
@@ -296,7 +294,7 @@ func runTestInfraUnmark(cmd *cobra.Command, _ []string) error {
 
 // unmarkTestInfra deletes the marker through pkg/testinfra after checking
 // that it names --hub-id, and reports it.
-func unmarkTestInfra(ctx context.Context, client *ent.Client, out io.Writer) error {
+func unmarkTestInfra(ctx context.Context, client any, out io.Writer) error {
 	m, err := testinfra.Read(ctx, client)
 	if err != nil {
 		return err
@@ -317,7 +315,7 @@ func unmarkTestInfra(ctx context.Context, client *ent.Client, out io.Writer) err
 }
 
 // markTestInfra writes the marker through pkg/testinfra and reports it.
-func markTestInfra(ctx context.Context, client *ent.Client, cfg *config.GlobalConfig, out io.Writer) error {
+func markTestInfra(ctx context.Context, client any, cfg *config.GlobalConfig, out io.Writer) error {
 	if err := checkTestInfraMarkHubID(cfg, testInfraMarkHubID); err != nil {
 		return err
 	}
@@ -356,46 +354,21 @@ func markTestInfra(ctx context.Context, client *ent.Client, cfg *config.GlobalCo
 }
 
 // openTestInfraClient opens the configured database and migrates it.
-func openTestInfraClient(ctx context.Context, cfg *config.GlobalConfig) (*ent.Client, error) {
-	pool := entc.PoolConfig{MaxOpenConns: 2, MaxIdleConns: 2}
-	var client *ent.Client
-	var err error
+func openTestInfraClient(ctx context.Context, cfg *config.GlobalConfig) (*restatehub.RestateStore, error) {
 	switch strings.ToLower(cfg.Database.Driver) {
-	case "sqlite", "":
-		dsn := cfg.Database.URL
-		if !strings.HasPrefix(dsn, "file:") {
-			dsn = "file:" + dsn
-		}
-		if !strings.Contains(dsn, "?") {
-			dsn += "?cache=shared"
-		} else if !strings.Contains(dsn, "cache=") {
-			dsn += "&cache=shared"
-		}
-		client, err = entc.OpenSQLite(dsn, pool)
-	case "postgres":
-		client, err = entc.OpenPostgres(cfg.Database.URL, pool)
+	case "sqlite", "postgres", "restate", "":
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", cfg.Database.Driver)
 	}
-	if err != nil {
-		return nil, err
-	}
-	// The same migration entry point, and PostgreSQL search_path shadow
-	// guard, as the server and recover-authz.
-	if err := migrateHubStore(ctx, entadapter.NewCompositeStore(client), cfg.Database.AllowShadowedSchema); err != nil {
-		_ = client.Close()
+	s := restatehub.NewRestateStore(nil, nil)
+	if err := migrateHubStore(ctx, s, cfg.Database.AllowShadowedSchema); err != nil {
+		_ = s.Close()
 		return nil, fmt.Errorf("failed to run database migration: %w", err)
 	}
-	return client, nil
+	return s, nil
 }
 
-// loadTestIdentityWebSessionKey reads the hub-local test identity web
-// session key from the test infrastructure marker at startup (WS1, DEC-8).
-// It never fails startup: with test identities off, no database, or a
-// missing, mismatched or malformed key, it returns no key and the reason,
-// and test identity web sessions are unavailable. It never falls back to a
-// key derived from the shared session secret, and never logs the key.
-func loadTestIdentityWebSessionKey(ctx context.Context, client *ent.Client, hubID string, enabled bool) hub.TestIdentityWebSessionKey {
+func loadTestIdentityWebSessionKey(ctx context.Context, client any, hubID string, enabled bool) hub.TestIdentityWebSessionKey {
 	if !enabled {
 		return hub.TestIdentityWebSessionKey{Unavailable: "test_identities_disabled"}
 	}

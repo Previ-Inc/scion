@@ -28,14 +28,11 @@ import (
 	"sync"
 	"time"
 
-	entsql "entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/pgprovider"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/integrationupdate"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
@@ -550,7 +547,6 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 	// non-HA mode uses YAML config file.
 	if len(req.Settings) > 0 {
 		var provider config.IntegrationConfigProvider
-		var haConfigTx *ent.Tx
 
 		if isHA {
 			if !s.requirePostgres(w) {
@@ -560,17 +556,9 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 				InternalError(w)
 				return
 			}
-			haTx, txErr := s.entClient.Tx(ctx)
-			if txErr != nil {
-				slog.Error("Failed to begin transaction for config update", "plugin", name, "error", txErr)
-				InternalError(w)
-				return
-			}
-			defer func() { _ = haTx.Rollback() }()
-			pgProvider := pgprovider.NewPostgresConfigProvider(haTx.Client(), name)
+			pgProvider := pgprovider.NewPostgresConfigProvider(s.entClient, name)
 			pgProvider.SetUpdatedBy(userID)
 			provider = pgProvider
-			haConfigTx = haTx
 		} else {
 			configFile := ""
 			if loaded {
@@ -631,21 +619,6 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		// For HA mode, NOTIFY within the same transaction as the config write.
-		if haConfigTx != nil {
-			signal := AdminSignal{
-				Integration: name,
-				Kind:        "config",
-			}
-			if err := publishAdminSignalTx(ctx, haConfigTx, signal); err != nil {
-				slog.Warn("Failed to NOTIFY config change", "integration", name, "error", err)
-			}
-			if err := haConfigTx.Commit(); err != nil {
-				slog.Error("Failed to commit config update transaction", "plugin", name, "error", err)
-				InternalError(w)
-				return
-			}
-		}
 	}
 
 	// Ensure the plugin is listed in message_broker.types on disk so it
@@ -1855,55 +1828,49 @@ func (s *Server) handleGetUpdateStatus(w http.ResponseWriter, r *http.Request, n
 		return
 	}
 
-	client := s.entClient
-	if client == nil {
+	if s.entClient == nil || s.updateTracker == nil {
 		InternalError(w)
 		return
 	}
 
-	ctx := r.Context()
-	var row *ent.IntegrationUpdate
-	var err error
-
+	s.updateTracker.mu.Lock()
+	var row *integrationUpdateRecord
 	if updateRef == "latest" {
-		row, err = client.IntegrationUpdate.
-			Query().
-			Where(integrationupdate.IntegrationEQ(name)).
-			Order(integrationupdate.ByCreateTime(entsql.OrderDesc())).
-			First(ctx)
+		for _, r := range s.updateTracker.updates {
+			if r.Integration == name {
+				if row == nil || r.CreateTime.After(row.CreateTime) {
+					cp := *r
+					row = &cp
+				}
+			}
+		}
 	} else {
 		uid, parseErr := uuid.Parse(updateRef)
 		if parseErr != nil {
+			s.updateTracker.mu.Unlock()
 			BadRequest(w, "invalid update id")
 			return
 		}
-		row, err = client.IntegrationUpdate.
-			Query().
-			Where(
-				integrationupdate.IDEQ(uid),
-				integrationupdate.IntegrationEQ(name),
-			).
-			Only(ctx)
-	}
-
-	if err != nil {
-		if ent.IsNotFound(err) {
-			NotFound(w, "update")
-			return
+		if r, ok := s.updateTracker.updates[uid]; ok && r.Integration == name {
+			cp := *r
+			row = &cp
 		}
-		slog.Error("Failed to query integration update", "integration", name, "ref", updateRef, "error", err)
-		InternalError(w)
+	}
+	s.updateTracker.mu.Unlock()
+
+	if row == nil {
+		NotFound(w, "update")
 		return
 	}
 
 	writeJSON(w, http.StatusOK, integrationUpdateToResponse(row))
 }
 
-func integrationUpdateToResponse(row *ent.IntegrationUpdate) IntegrationUpdateResponse {
+func integrationUpdateToResponse(row *integrationUpdateRecord) IntegrationUpdateResponse {
 	return IntegrationUpdateResponse{
 		ID:          row.ID.String(),
 		Integration: row.Integration,
-		State:       string(row.State),
+		State:       row.State,
 		Detail:      row.Detail,
 		NewVersion:  row.NewVersion,
 		RequestedBy: row.RequestedBy,
@@ -1912,48 +1879,31 @@ func integrationUpdateToResponse(row *ent.IntegrationUpdate) IntegrationUpdateRe
 	}
 }
 
-// handleUpdateIntegrationHA handles POST .../update for HA integrations.
-// It inserts an integration_updates row in "requested" state, fires a NOTIFY,
-// and returns 202 with the update_id for polling.
 func (s *Server) handleUpdateIntegrationHA(w http.ResponseWriter, r *http.Request, name string) {
 	if !s.requirePostgres(w) {
 		return
 	}
-
-	client := s.entClient
-	if client == nil {
+	if s.entClient == nil || s.updateTracker == nil {
 		InternalError(w)
 		return
 	}
 
-	// Reject if a non-terminal update already exists for this integration.
-	ctx := r.Context()
-	existingCount, err := client.IntegrationUpdate.Query().
-		Where(
-			integrationupdate.IntegrationEQ(name),
-			integrationupdate.StateNotIn(
-				integrationupdate.StateCompleted,
-				integrationupdate.StateFailed,
-			),
-		).
-		Count(ctx)
-	if err != nil {
-		slog.Error("Failed to check for pending updates", "integration", name, "error", err)
-		InternalError(w)
-		return
+	s.updateTracker.mu.Lock()
+	for _, existing := range s.updateTracker.updates {
+		if existing.Integration == name && existing.State != "completed" && existing.State != "failed" {
+			s.updateTracker.mu.Unlock()
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "An update is already in progress for this integration",
+			})
+			return
+		}
 	}
-	if existingCount > 0 {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "An update is already in progress for this integration",
-		})
-		return
-	}
+	s.updateTracker.mu.Unlock()
 
 	s.mu.RLock()
 	mgr := s.pluginManager
 	s.mu.RUnlock()
 
-	// Capture pre-update version so completion detection can compare.
 	preUpdateVersion := ""
 	if mgr != nil {
 		if version, _, _, err := mgr.BrokerInfo(name); err == nil {
@@ -1961,52 +1911,31 @@ func (s *Server) handleUpdateIntegrationHA(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	ctx := r.Context()
 	user := GetUserIdentityFromContext(ctx)
 	requestedBy := ""
 	if user != nil {
 		requestedBy = user.ID()
 	}
 
-	tx, err := client.Tx(ctx)
-	if err != nil {
-		slog.Error("Failed to begin transaction for integration update", "integration", name, "error", err)
-		InternalError(w)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	create := tx.IntegrationUpdate.
-		Create().
-		SetIntegration(name).
-		SetState(integrationupdate.StateRequested).
-		SetRequestedBy(requestedBy)
+	now := time.Now().UTC()
+	detail := ""
 	if preUpdateVersion != "" {
-		create = create.SetDetail("pre_update_version=" + preUpdateVersion)
+		detail = "pre_update_version=" + preUpdateVersion
 	}
-
-	row, err := create.Save(ctx)
-	if err != nil {
-		slog.Error("Failed to create integration update request", "integration", name, "error", err)
-		InternalError(w)
-		return
-	}
-
-	signal := AdminSignal{
+	row := &integrationUpdateRecord{
+		ID:          uuid.New(),
 		Integration: name,
-		Kind:        "update",
-		ID:          row.ID.String(),
+		State:       "requested",
+		Detail:      detail,
+		RequestedBy: requestedBy,
+		CreateTime:  now,
+		UpdateTime:  now,
 	}
-	if err := publishAdminSignalTx(ctx, tx, signal); err != nil {
-		slog.Warn("Failed to NOTIFY integration update", "integration", name, "error", err)
-	}
+	s.updateTracker.mu.Lock()
+	s.updateTracker.updates[row.ID] = row
+	s.updateTracker.mu.Unlock()
 
-	if err := tx.Commit(); err != nil {
-		slog.Error("Failed to commit integration update transaction", "integration", name, "error", err)
-		InternalError(w)
-		return
-	}
-
-	// Start poll-based completion detection.
 	s.startUpdateTracking(name, row.ID.String(), preUpdateVersion)
 
 	writeJSON(w, http.StatusAccepted, map[string]string{

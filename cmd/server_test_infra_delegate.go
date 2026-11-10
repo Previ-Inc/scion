@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/testinfra"
 	"github.com/spf13/cobra"
@@ -212,7 +211,7 @@ func runTestInfraDelegate(cmd *cobra.Command, _ []string) error {
 
 // delegateTestInfra re-checks the configuration guards, creates the
 // delegation through pkg/testinfra and reports it. It prints no token.
-func delegateTestInfra(ctx context.Context, client *ent.Client, cfg *config.GlobalConfig, out io.Writer) error {
+func delegateTestInfra(ctx context.Context, client any, cfg *config.GlobalConfig, out io.Writer) error {
 	if err := checkTestInfraDelegateConfig(cfg, testInfraDelegateHubID); err != nil {
 		return err
 	}
@@ -266,7 +265,7 @@ func runTestInfraDelegateRevoke(cmd *cobra.Command, _ []string) error {
 
 // revokeTestInfraDelegation revokes an offline delegation through
 // pkg/testinfra and reports it.
-func revokeTestInfraDelegation(ctx context.Context, client *ent.Client, out io.Writer) error {
+func revokeTestInfraDelegation(ctx context.Context, client any, out io.Writer) error {
 	operator := testInfraDelegateRevokeOperator
 	if operator == "" {
 		operator = resolveOperatorIdentity()

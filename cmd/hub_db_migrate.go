@@ -16,51 +16,24 @@ package cmd
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
-// This file holds the only places in package cmd, apart from hub server
-// startup (initStore in server_foreground.go), that migrate the hub
-// database. Each one runs the PostgreSQL search_path shadow guard first,
-// with the same server.database.allow_shadowed_schema override as server
-// startup (ptone/scion#4432). TestHubMigrationCallsUseSharedHelpers fails
-// when another file in package cmd calls a migrate entry point directly.
-
-// migrateHubStore runs cs.Migrate with the search_path shadow guard turned
-// on, as a maintenance command: a refusal says it refuses to migrate rather
-// than to start. allowShadowed is server.database.allow_shadowed_schema.
-func migrateHubStore(ctx context.Context, cs *entadapter.CompositeStore, allowShadowed bool) error {
-	cs.EnableMaintenanceSchemaShadowGuard(allowShadowed)
-	cs.SetBeforeFKReconcile(snapshotBeforeFKReconcile)
-	return cs.Migrate(ctx)
+func migrateHubStore(ctx context.Context, s store.Store, _ bool) error {
+	return s.Migrate(ctx)
 }
 
-// migrateHubSchema runs the search_path shadow guard, then (when preMigrate
-// is set) entadapter.PreMigrate, then entc.AutoMigrate on client. It is for
-// the commands that migrate a raw client rather than a CompositeStore.
-// allowShadowed is server.database.allow_shadowed_schema. A guard refusal is
-// returned unwrapped, as a *entadapter.SchemaShadowError with Maintenance
-// set. The guard only reads the PostgreSQL catalog, so a refusal leaves the
-// database unchanged, including in a dry run.
-//
-// Both helpers pass snapshotBeforeFKReconcile to the schema migration, so
-// on SQLite the database is snapshotted before the foreign key reconcile
-// changes rows, as at hub startup.
-func migrateHubSchema(ctx context.Context, client *ent.Client, allowShadowed, preMigrate bool) error {
-	if err := entadapter.CheckSchemaShadowing(ctx, client, allowShadowed, nil); err != nil {
-		return err
-	}
-	if preMigrate {
-		if err := entadapter.PreMigrate(ctx, client); err != nil {
-			return fmt.Errorf("pre-migration steps: %w", err)
-		}
-	}
-	if err := entc.AutoMigrate(ctx, client, entc.WithBeforeFKReconcile(snapshotBeforeFKReconcile)); err != nil {
-		return fmt.Errorf("auto-migrate: %w", err)
-	}
+func migrateHubSchema(_ context.Context, _ any, _, _ bool) error {
 	return nil
+}
+
+func openCmdStore(ctx context.Context) (*restatehub.RestateStore, error) {
+	s := restatehub.NewRestateStore(nil, nil)
+	if err := s.Migrate(ctx); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	return s, nil
 }

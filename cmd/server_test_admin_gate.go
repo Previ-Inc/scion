@@ -21,7 +21,6 @@ import (
 	"os"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub"
 	"github.com/GoogleCloudPlatform/scion/pkg/testinfra"
 	"github.com/spf13/cobra"
@@ -354,7 +353,7 @@ func resolveTestMode(in testModeInputs) (testModeResolution, error) {
 }
 
 // testModeInputsFor assembles the gate inputs at hub construction.
-func testModeInputsFor(ctx context.Context, cfg *config.GlobalConfig, hubCfg hub.ServerConfig, hasStore bool, entClient *ent.Client) testModeInputs {
+func testModeInputsFor(ctx context.Context, cfg *config.GlobalConfig, hubCfg hub.ServerConfig, hasStore bool, entClient any) testModeInputs {
 	return testModeInputs{
 		Level:                   testModeLevel,
 		BindingHubID:            testModeHubID,

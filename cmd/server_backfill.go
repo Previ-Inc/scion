@@ -16,18 +16,15 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/spf13/cobra"
 )
 
@@ -164,63 +161,28 @@ func runBackfillWithStore(ctx context.Context, s store.Store, cfg messaging.Back
 // Precedence: --db flag > config file (via LoadGlobalConfig).
 // By default, runs AutoMigrate to ensure the schema is up to date.
 // Pass readOnly=true to skip migrations (for read-only commands).
-func openBackfillStore(ctx context.Context, readOnly ...bool) (*entadapter.CompositeStore, error) {
+func openBackfillStore(ctx context.Context, readOnly ...bool) (*restatehub.RestateStore, error) {
 	skipMigrations := len(readOnly) > 0 && readOnly[0]
-
 	cfg, err := config.LoadGlobalConfig(serverConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
-
-	// --db flag overrides config.
 	maintenanceDBOverride(cfg, backfillDB)
-
 	if cfg.Database.URL == "" {
 		return nil, fmt.Errorf("no database configured: set --db, SCION_SERVER_DATABASE_URL env, or database.url in server config")
 	}
-
-	var s *entadapter.CompositeStore
-
 	switch cfg.Database.Driver {
-	case "sqlite":
-		dsn := cfg.Database.URL
-		if !strings.HasPrefix(dsn, "file:") {
-			dsn = "file:" + dsn
-		}
-		if !strings.Contains(dsn, "?") {
-			dsn += "?cache=shared"
-		} else if !strings.Contains(dsn, "cache=") {
-			dsn += "&cache=shared"
-		}
-		client, err := entc.OpenSQLite(dsn, entc.PoolConfig{})
-		if err != nil {
-			return nil, fmt.Errorf("opening sqlite: %w", err)
-		}
-		if !skipMigrations {
-			if err := migrateMaintenanceDB(ctx, client, backfillExecute, cfg.Database.AllowShadowedSchema); err != nil {
-				_ = client.Close()
-				return nil, err
-			}
-		}
-		s = entadapter.NewCompositeStore(client)
-
-	case "postgres":
-		client, err := entc.OpenPostgres(cfg.Database.URL, entc.PoolConfig{MaxOpenConns: 10, MaxIdleConns: 5})
-		if err != nil {
-			return nil, fmt.Errorf("opening postgres (verify DSN and network connectivity): %w", err)
-		}
-		if !skipMigrations {
-			if err := migrateMaintenanceDB(ctx, client, backfillExecute, cfg.Database.AllowShadowedSchema); err != nil {
-				_ = client.Close()
-				return nil, err
-			}
-		}
-		s = entadapter.NewCompositeStore(client)
-
+	case "sqlite", "postgres", "restate", "":
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", cfg.Database.Driver)
 	}
-
+	s := restatehub.NewRestateStore(nil, nil)
+	if !skipMigrations {
+		if err := migrateMaintenanceDB(ctx, s, backfillExecute, cfg.Database.AllowShadowedSchema); err != nil {
+			_ = s.Close()
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
@@ -249,17 +211,17 @@ func maintenanceDBOverride(cfg *config.GlobalConfig, dsn string) {
 //
 // Like server start, it first runs the PostgreSQL search_path shadow guard;
 // allowShadowed is server.database.allow_shadowed_schema (ptone/scion#4432).
-func migrateMaintenanceDB(ctx context.Context, client *ent.Client, execute, allowShadowed bool) error {
-	err := migrateHubSchema(ctx, client, allowShadowed, execute)
-	if err == nil {
+func migrateMaintenanceDB(ctx context.Context, client any, execute, allowShadowed bool) error {
+	if s, ok := client.(store.Store); ok {
+		if err := migrateHubStore(ctx, s, allowShadowed); err != nil {
+			return fmt.Errorf("running migrations: %w", err)
+		}
 		return nil
 	}
-	var shadow *entadapter.SchemaShadowError
-	if !execute && !errors.As(err, &shadow) {
-		return fmt.Errorf("running migrations (a dry run skips the pre-migration steps that remove duplicate rows; "+
-			"on a unique-constraint error, rerun with --execute or start the Hub once on this version): %w", err)
+	if err := migrateHubSchema(ctx, client, allowShadowed, execute); err != nil {
+		return fmt.Errorf("running migrations: %w", err)
 	}
-	return fmt.Errorf("running migrations: %w", err)
+	return nil
 }
 
 // mergeBackfillResult adds the counts from src into dst.

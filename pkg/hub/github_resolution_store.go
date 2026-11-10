@@ -23,18 +23,23 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubresolutioncache"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/schema"
 )
 
 // GitHubFileEntry represents a single file in a GitHub skill resolution result.
-// This is a value type (not an ent entity) stored as JSON.
-type GitHubFileEntry = schema.GitHubFileEntry
+// This is a value type stored as JSON.
+type GitHubFileEntry struct {
+	Path string `json:"path"`
+	URL  string `json:"url"`
+	Hash string `json:"hash"`
+	Size int64  `json:"size"`
+	Mode string `json:"mode,omitempty"`
+}
 
 // GitHubCacheEntry represents a cached GitHub skill resolution result.
 type GitHubCacheEntry struct {
@@ -46,38 +51,31 @@ type GitHubCacheEntry struct {
 	OriginalURI string
 }
 
-// GitHubResolutionStore wraps the ent client for GitHub skill resolution cache operations.
+// GitHubResolutionStore stores GitHub skill resolution cache entries.
 type GitHubResolutionStore struct {
-	client *ent.Client
+	mu      sync.RWMutex
+	entries map[string]GitHubCacheEntry
 }
 
 // NewGitHubResolutionStore creates a new GitHubResolutionStore.
-func NewGitHubResolutionStore(client *ent.Client) *GitHubResolutionStore {
-	return &GitHubResolutionStore{client: client}
+func NewGitHubResolutionStore(_ ...any) *GitHubResolutionStore {
+	return &GitHubResolutionStore{
+		entries: make(map[string]GitHubCacheEntry),
+	}
 }
 
 // load reads the row for cacheKey, returning (nil, nil) when there is none.
-func (s *GitHubResolutionStore) load(ctx context.Context, cacheKey string) (*GitHubCacheEntry, error) {
-	row, err := s.client.GitHubResolutionCache.
-		Query().
-		Where(githubresolutioncache.CacheKeyEQ(cacheKey)).
-		Only(ctx)
-	if err != nil {
-		if ent.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
+func (s *GitHubResolutionStore) load(_ context.Context, cacheKey string) (*GitHubCacheEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	row, ok := s.entries[cacheKey]
+	if !ok {
+		return nil, nil
 	}
-	return &GitHubCacheEntry{
-		CommitSHA:   row.CommitSha,
-		FileEntries: row.FileEntries,
-		BundleHash:  row.BundleHash,
-		TokenScope:  row.TokenScope,
-		ExpiresAt:   row.ExpiresAt,
-		OriginalURI: row.OriginalURI,
-	}, nil
+	cp := row
+	cp.FileEntries = slices.Clone(row.FileEntries)
+	return &cp, nil
 }
-
 // fileEntriesHaveModes reports whether every file entry records a mode.
 // Entries written since the hub reads GitHub trees always do; a row written
 // before has none (ptone/scion#5781).
@@ -161,19 +159,16 @@ func (s *GitHubResolutionStore) GetModeless(ctx context.Context, cacheKey string
 // write failed there and the cache was never populated. SQLite 3.35+ accepts
 // the same statement by inferring the lone eligible unique index, which is
 // why this went unnoticed in SQLite-only tests.
-func (s *GitHubResolutionStore) Put(ctx context.Context, cacheKey string, entry GitHubCacheEntry) error {
-	return s.client.GitHubResolutionCache.
-		Create().
-		SetCacheKey(cacheKey).
-		SetOriginalURI(entry.OriginalURI).
-		SetCommitSha(entry.CommitSHA).
-		SetFileEntries(entry.FileEntries).
-		SetBundleHash(entry.BundleHash).
-		SetTokenScope(entry.TokenScope).
-		SetExpiresAt(entry.ExpiresAt).
-		OnConflictColumns(githubresolutioncache.FieldCacheKey).
-		UpdateNewValues().
-		Exec(ctx)
+func (s *GitHubResolutionStore) Put(_ context.Context, cacheKey string, entry GitHubCacheEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries == nil {
+		s.entries = make(map[string]GitHubCacheEntry)
+	}
+	cp := entry
+	cp.FileEntries = slices.Clone(entry.FileEntries)
+	s.entries[cacheKey] = cp
+	return nil
 }
 
 // staleCutoff returns the ExpiresAt threshold at or below which a row can no
@@ -209,13 +204,16 @@ func staleCutoff(now time.Time, lastTTL, maxStaleAge time.Duration) time.Time {
 // for one) may then survive somewhat longer than its own TTL before purge,
 // which is harmless — its content is immutable, so an unnecessarily long wait
 // before deletion costs only a little extra storage, never a wrong answer.
-func (s *GitHubResolutionStore) PurgeExpired(ctx context.Context) error {
+func (s *GitHubResolutionStore) PurgeExpired(_ context.Context) error {
 	cutoff := staleCutoff(time.Now(), agent.DefaultResolutionCacheTTL, agent.MaxResolutionStaleAge)
-	_, err := s.client.GitHubResolutionCache.
-		Delete().
-		Where(githubresolutioncache.ExpiresAtLTE(cutoff)).
-		Exec(ctx)
-	return err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, e := range s.entries {
+		if !e.ExpiresAt.After(cutoff) {
+			delete(s.entries, k)
+		}
+	}
+	return nil
 }
 
 // computeCacheKey computes a deterministic cache key from the normalized URI and token scope.

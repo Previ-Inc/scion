@@ -33,7 +33,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/transport/ws"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 	conduitv1 "github.com/GoogleCloudPlatform/scion/proto/conduit/v1"
 	"github.com/gorilla/websocket"
 )
@@ -193,13 +192,11 @@ func (s *Server) StartConduitRelay(ctx context.Context, opts ConduitRelayOptions
 	}
 	st := opts.Store
 	if st == nil {
-		s.mu.RLock()
-		client := s.entClient
-		s.mu.RUnlock()
-		if client == nil {
+		if rs, ok := s.store.(registry.Store); ok {
+			st = rs
+		} else {
 			return errors.New("conduit relay: no database client for the conduit registry")
 		}
-		st = entadapter.NewConduitRegistryStore(client)
 	}
 	reg := opts.Registry
 	if reg == nil {

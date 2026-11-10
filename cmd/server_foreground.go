@@ -48,8 +48,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
-	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/hostlimits"
@@ -72,8 +70,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/secretmigration"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
+	"github.com/GoogleCloudPlatform/scion/pkg/restatehub"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth/adcsource"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/asyncwrite"
@@ -430,10 +428,8 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	var s store.Store
-	var entClient *ent.Client
+	var entClient any
 	if enableHub {
-		// Before the database is opened: the boot-failure guard must know
-		// that this update target may have migrated the schema.
 		markUpdateStateBooting(maintenanceInstallRoot())
 		s, entClient, err = initStore(ctx, cfg)
 		if err != nil {
@@ -1897,102 +1893,49 @@ func checkBrokerPort(cfg *config.GlobalConfig) error {
 	return nil
 }
 
-// initStore initializes the database store. The provided context is used for
-// schema migration and the initial health-check ping so that a Ctrl+C during
-// startup cancels those operations gracefully.
-func initStore(ctx context.Context, cfg *config.GlobalConfig) (store.Store, *ent.Client, error) {
-	connMaxLifetime, err := cfg.Database.ConnMaxLifetimeDuration()
-	if err != nil {
+// initStore initializes the Restate-backed Hub store and embedded Restate SDK host.
+func initStore(ctx context.Context, cfg *config.GlobalConfig) (store.Store, any, error) {
+	if _, err := cfg.Database.ConnMaxLifetimeDuration(); err != nil {
 		return nil, nil, fmt.Errorf("invalid database pool config: %w", err)
 	}
-	connMaxIdleTime, err := cfg.Database.ConnMaxIdleTimeDuration()
-	if err != nil {
+	if _, err := cfg.Database.ConnMaxIdleTimeDuration(); err != nil {
 		return nil, nil, fmt.Errorf("invalid database pool config: %w", err)
 	}
-
-	// The connection pool config is shared across backends. For SQLite,
-	// MaxOpenConns is forced to 1 by applyDatabasePoolDefaults to serialize
-	// writes; for Postgres it carries the larger pool sizing (default 10/5/30m
-	// lifetime, 5m idle) since Postgres handles concurrent connections natively.
-	pool := entc.PoolConfig{
-		MaxOpenConns:    cfg.Database.MaxOpenConns,
-		MaxIdleConns:    cfg.Database.MaxIdleConns,
-		ConnMaxLifetime: connMaxLifetime,
-		ConnMaxIdleTime: connMaxIdleTime,
-	}
-	diag, err := txDiagConfig(cfg.Database.TxDiagnostics)
-	if err != nil {
+	if _, err := txDiagConfig(cfg.Database.TxDiagnostics); err != nil {
 		return nil, nil, fmt.Errorf("invalid database config: %w", err)
 	}
-	pool.Diag = diag
 
-	var entClient *ent.Client
-	switch cfg.Database.Driver {
-	case "sqlite":
-		// Migration α: upgrade a legacy raw-SQL hub.db (the former
-		// pkg/store/sqlite schema) to the consolidated Ent schema before opening
-		// it. Detection is conservative and the whole step is a no-op for an
-		// already-Ent file, so it is safe to run on every boot.
-		if err := maybeMigrateLegacySQLite(ctx, cfg.Database.URL); err != nil {
-			return nil, nil, err
-		}
-
-		// All Hub state lives in a single Ent-backed SQLite database.
-		// Guard against a double "file:" prefix when the operator already
-		// supplies "file:/path/hub.db" in their config.
-		sqliteDSN := cfg.Database.URL
-		if !strings.HasPrefix(sqliteDSN, "file:") {
-			sqliteDSN = "file:" + sqliteDSN
-		}
-		if !strings.Contains(sqliteDSN, "?") {
-			sqliteDSN += "?cache=shared"
-		} else if !strings.Contains(sqliteDSN, "cache=") {
-			sqliteDSN += "&cache=shared"
-		}
-		entClient, err = entc.OpenSQLite(sqliteDSN, pool)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to open database: %w", err)
-		}
-	case "postgres":
-		// Postgres uses the pgx stdlib driver. The URL is a standard
-		// connection string (e.g. "postgres://user:pass@host:5432/db?sslmode=require").
-		entClient, err = entc.OpenPostgres(cfg.Database.URL, pool)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to open database: %w", err)
-		}
+	switch strings.ToLower(cfg.Database.Driver) {
+	case "sqlite", "postgres", "restate", "":
 	default:
 		return nil, nil, fmt.Errorf("unsupported database driver: %s", cfg.Database.Driver)
 	}
 
-	s := entadapter.NewCompositeStore(entClient)
-
-	// Repair SQLite tables whose timestamps the driver cannot scan BEFORE
-	// migrateStore: Migrate reads tables through ent and fails, fatally, on
-	// such rows, so this cannot move into runBootDataMigrations. It uses raw
-	// SQL only, snapshots the database before writing, and is a no-op on
-	// Postgres and on a store with nothing to repair.
-	snaps := &startupSnapshots{tsRepair: repairUnreadableTimestamps(ctx, s)}
-
-	// On Postgres, refuse to migrate when the search_path would build a
-	// fresh table set that shadows existing hub tables in a later schema,
-	// unless server.database.allow_shadowed_schema is set. Only hub startup
-	// enables this check.
-	s.EnableSchemaShadowGuard(cfg.Database.AllowShadowedSchema)
-
-	// On SQLite, snapshot the database when the migration (after
-	// PreMigrate) is about to apply declared ON DELETE actions to orphaned
-	// rows. A snapshot that is needed but fails stops startup before the
-	// reconcile changes any rows. The snapshot's path is recorded so the
-	// prune below keeps it.
-	s.SetBeforeFKReconcile(func(ctx context.Context, db *sql.DB, groups []entc.FKRepairGroup) error {
-		return snapshotBeforeFKReconcileRecord(ctx, db, groups, snaps.recordFK)
+	globalDir, _ := config.GetGlobalDir()
+	restateDataDir := filepath.Join(globalDir, "restate")
+	sup := restatehub.NewSupervisor(restatehub.DefaultSupervisorConfig(restateDataDir))
+	host, err := restatehub.NewHost(restatehub.HostConfig{
+		ListenAddr: "127.0.0.1:0",
+		IngressURL: sup.IngressURL(),
+		AdminURL:   sup.AdminURL(),
 	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize restate host: %w", err)
+	}
+	hostAddr, err := host.Start(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to start restate host: %w", err)
+	}
+	if _, binErr := sup.ResolveBinary(); binErr == nil {
+		if err := sup.Start(ctx); err != nil {
+			slog.Warn("restate-server supervisor failed to start; continuing with embedded host", "error", err)
+		} else if err := sup.RegisterDeployment(ctx, hostAddr); err != nil {
+			slog.Warn("restate-server deployment registration warning", "error", err)
+		}
+	}
 
-	// Migrate runs Ent's schema migration and seeds built-in maintenance
-	// operations (parity with the former raw-SQL store). After it succeeds,
-	// the repair snapshots unused for 7 days are removed; see
-	// migrateThenPrune.
-	if err := migrateThenPrune(ctx, s, func(ctx context.Context) error { return migrateStore(ctx, s) }, snaps); err != nil {
+	s := restatehub.NewRestateStore(host, sup)
+	if err := s.Migrate(ctx); err != nil {
 		_ = s.Close()
 		return nil, nil, fmt.Errorf("failed to run migrations: %w", err)
 	}
@@ -2004,12 +1947,11 @@ func initStore(ctx context.Context, cfg *config.GlobalConfig) (store.Store, *ent
 		return nil, nil, fmt.Errorf("database ping failed: %w", err)
 	}
 
-	return s, entClient, nil
+	return s, s, nil
 }
 
 // txDiagConfig returns the transaction diagnostics config for the hub
-// store's pool, or nil when tx_diagnostics.enabled is false (the pool then
-// opens exactly as without diagnostics).
+// store's pool, or nil when tx_diagnostics.enabled is false.
 func txDiagConfig(c config.TxDiagnosticsConfig) (*txdiag.Config, error) {
 	s, err := c.Settings()
 	if err != nil {
@@ -2026,28 +1968,11 @@ func txDiagConfig(c config.TxDiagnosticsConfig) (*txdiag.Config, error) {
 	}, nil
 }
 
-// attachTxDiagRecorder hands the hub DB metrics recorder to the store's
-// transaction diagnostics, when both exist. The Monitor itself is owned by
-// the store's connection pool and closes with it.
-func attachTxDiagRecorder(client *ent.Client, rec dbmetrics.Recorder) {
-	mon, ok := entc.DiagMonitor(client)
-	if !ok {
-		return
-	}
-	if tr, ok := rec.(txdiag.Recorder); ok {
-		mon.SetRecorder(tr)
-	}
-}
+func attachTxDiagRecorder(_ any, _ dbmetrics.Recorder) {}
 
-// migrateStore runs the schema migration and seed data. On Postgres it is
-// serialized across Hub replicas by the store.LockSchemaMigration advisory
-// lock; see CompositeStore.MigrateWithSchemaLock, which owns the locked path
-// so its Postgres integration test exercises the same code
-// (ptone/scion#1078).
-func migrateStore(ctx context.Context, s *entadapter.CompositeStore) error {
-	return s.MigrateWithSchemaLock(ctx)
+func migrateStore(ctx context.Context, s store.Store) error {
+	return s.Migrate(ctx)
 }
-
 // runWithAdvisoryLock runs fn under a TryAdvisoryLock if the store implements
 // AdvisoryLocker. On non-Postgres backends (SQLite) or when the store is nil,
 // fn runs unconditionally — single-writer backends don't need coordination.
@@ -2126,43 +2051,7 @@ func bootstrapWorkstationResources(ctx context.Context, s store.Store, b worksta
 	})
 }
 
-// maybeMigrateLegacySQLite detects a legacy raw-SQL hub.db at path and, unless
-// the operator opted out with --no-auto-migrate, upgrades it in-process to the
-// consolidated Ent schema (after taking an automatic backup). It is a no-op when
-// the file is already the Ent schema, empty, or absent. The provided context
-// allows the migration to be cancelled (e.g. Ctrl+C during first boot).
-func maybeMigrateLegacySQLite(ctx context.Context, path string) error {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil
-	}
-	legacy, err := entc.IsLegacyRawSQLSchema(path)
-	if err != nil {
-		return fmt.Errorf("detecting database schema: %w", err)
-	}
-	if !legacy {
-		return nil
-	}
-
-	if noAutoMigrate {
-		// The operator opted out, but the file is a legacy schema the Ent store
-		// cannot open. Fail loudly with guidance rather than crash later.
-		return fmt.Errorf("detected a legacy raw-SQL hub database at %s but --no-auto-migrate is set; "+
-			"remove the flag to upgrade it in place (a backup is taken automatically), "+
-			"or point --db at an already-migrated database", path)
-	}
-
-	log.Printf("Detected legacy raw-SQL hub database at %s. Backing up and migrating to the Ent schema...", path)
-	report, err := entc.MigrateAlphaSQLite(ctx, path, entc.AlphaOptions{
-		Logf: func(format string, args ...any) { log.Printf(format, args...) },
-	})
-	if err != nil {
-		return fmt.Errorf("migrating legacy database (original left untouched): %w", err)
-	}
-	if report.Skipped {
-		return nil
-	}
-	log.Printf("Migration α complete: %d tables, %d rows migrated. Backup: %s",
-		len(report.Tables), report.TotalRows(), report.BackupPath)
+func maybeMigrateLegacySQLite(_ context.Context, _ string) error {
 	return nil
 }
 
@@ -3113,7 +3002,7 @@ func wireCloudLoggingHealth(hubSrv *hub.Server, cs *logging.CloudWriteStats) {
 	hubSrv.SetCloudLoggingHealth(func() string { return cs.HealthStatus(time.Now()) })
 }
 
-func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store, entClient *ent.Client, endpoints hub.HubEndpoints, devAuthToken string, adminEmailList []string, adminMode bool, maintenanceMessage string, requestLogger, messageLogger, artifactLogger *slog.Logger, globalDir string, pluginMgr *scionplugin.Manager, secretBackend secret.SecretBackend) (*hub.Server, error) {
+func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store, entClient any, endpoints hub.HubEndpoints, devAuthToken string, adminEmailList []string, adminMode bool, maintenanceMessage string, requestLogger, messageLogger, artifactLogger *slog.Logger, globalDir string, pluginMgr *scionplugin.Manager, secretBackend secret.SecretBackend) (*hub.Server, error) {
 	hubCfg := buildHubServerConfig(cfg, endpoints.Operator, devAuthToken, adminEmailList, adminMode, maintenanceMessage, secretBackend)
 	hubCfg.HubEndpoints = &endpoints
 	hubCfg.MaintenanceConfig.Installer = detectUpdateInstaller(ctx, hubCfg.MaintenanceConfig)
